@@ -77,6 +77,7 @@ EiF <- function(ests, L, R, x, z, delta, dist){
   # Surv_R <- SurvF(R, tau, surv_param, beta, z, dist)
   
   Ei <- pi / (pi + (1-pi)*Surv_L)
+  Ei[delta==1] <- 1
   return(Ei)
 }
 
@@ -100,14 +101,14 @@ QloglikF <- function(params, Ei, L, R, x, z, delta, dist){
   Surv_L <- SurvF(L, tau, surv_param, beta, z, dist)
   Surv_R <- SurvF(R, tau, surv_param, beta, z, dist)
   
-  qloglik <- (1-delta)*(Ei*log(pi) + (1-Ei)*log(1-pi)) +
-    (delta+(1-delta)*(1-Ei))*log(Surv_L-Surv_R)
+  
+  qloglik <- Ei*log((1-pi)*(Surv_L-Surv_R)) + (1-Ei)*log(pi)
   qloglik[is.infinite(qloglik)] <- 0
   sum(qloglik, na.rm = T)
 }
 
 
-gradF <- function(params, Ei=NULL, L, R, x, z, delta, dist){
+gradF <- function(params, Ei, L, R, x, z, delta, dist){
   tau <- sort(unique(c(L, R)))
   tau <- tau[!is.infinite(tau)]
   n_cure <- ncol(x)
@@ -154,17 +155,36 @@ gradF <- function(params, Ei=NULL, L, R, x, z, delta, dist){
     return(c(dL_alpha, dL_beta, dL_lambda))
   }
   if(dist == "weibull"){
-    dQ_pi <- (1-delta) * (Ei/pi - (1-Ei)/(1-pi))
+    dQ_pi <- -(Ei/(1-pi)) + (1-Ei)/pi
     dpi_alpha <- apply(x, 2, function(col) (pi - pi^2)*col)
     dQ_i_alpha <- apply(dpi_alpha, 2, function(col) dQ_pi*col)
     
-    dQ_i_u <- (delta + (1-delta)*(1-Ei))/(Surv_L-Surv_R) * (Surv_L*log(Surv_L) - Surv_R*log(Surv_R))
-    dQ_i_u[is.na(dQ_i_u)] <- 0
-    dQ_i_v <- (delta + (1-delta)*(1-Ei))/(Surv_L-Surv_R) * 
-      (Surv_L*log(Surv_L)*log(L) - Surv_R*log(Surv_R)*log(R))*exp(v)
-    dQ_i_v[is.na(dQ_i_v)] <- 0
-    dQ_i_beta <- apply(z, 2, function(col){((delta + (1-delta)*(1-Ei))/(Surv_L-Surv_R) * (Surv_L*log(Surv_L) - Surv_R*log(Surv_R)))*col})
-    dQ_i_beta[is.na(dQ_i_beta)] <- 0
+    dS_u <- function(t, tau, surv_param, beta, z, dist){
+      surv <- SurvF(t, tau, surv_param, beta, z, dist)
+      surv2 <- surv*log(surv)
+      surv2[is.infinite(t)] <- 0
+      surv2
+      }
+
+    dS_v <- function(t, tau, surv_param, beta, z, dist){
+      surv <- SurvF(t, tau, surv_param, beta, z, dist)
+      surv2 <- surv*log(surv)*log(t)*exp(surv_param[2])
+      surv2[is.infinite(t)] <- 0
+      surv2
+    }
+
+    dS_beta <- function(t, tau, surv_param, beta, z, dist){
+      surv <- SurvF(t, tau, surv_param, beta, z, dist)
+      surv2 <- apply(z, 2, function(col) surv*log(surv)*log(t)*col)
+      surv2[is.infinite(t),] <- 0
+      surv2
+    }
+    
+    dQ_i_u <- Ei/(Surv_L-Surv_R)*(dS_u(t=L, tau, surv_param, beta, z, dist) - dS_u(t=R, tau, surv_param, beta, z, dist))
+    dQ_i_v <- Ei/(Surv_L-Surv_R)*(dS_v(t=L, tau, surv_param, beta, z, dist) - dS_v(t=R, tau, surv_param, beta, z, dist))
+    dQ_i_beta <- apply((dS_beta(t=L, tau, surv_param, beta, z, dist) - dS_beta(t=R, tau, surv_param, beta, z, dist)),
+                       2,
+                       function(col) Ei/(Surv_L-Surv_R)*(col))
     
     dQ_alpha <- colSums(dQ_i_alpha)
     dQ_beta <- colSums(dQ_i_beta)
@@ -271,6 +291,7 @@ estF <- function(L, R, x, z, delta, bs_iter = NULL, dist){
     ######################## Initialization ######################## 
     params_init <- c(rnorm(ncol(x)+ncol(z)), -0.0001, 0.002)
     Ei_init <- runif(nrow(x))
+    Ei_init[delta==1] <- 1
     ests <- optim(par = params_init, fn = QloglikF, gr = gradF,
                   L = L, R = R, 
                   Ei = Ei_init,

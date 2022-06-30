@@ -5,8 +5,8 @@ library(survminer)
 library(gtsummary)
 library(icenReg)
 
-load(here("MSK/data", "rec_mskcc.RData"))
-source(here("MSK/src", "analysis_functions.R"))
+load(here("data", "rec_mskcc.RData"))
+source(here("src", "analysis_functions.R"))
 
 data_processing <- function(dset, digit){
   dset <- dset %>% mutate(
@@ -43,30 +43,10 @@ analysis <- function(dset){
     labs(x = "Time", y = "Survival Probability", color = "txpathgrade_cat") +
     theme_minimal()
   g
-  # mixcure(Surv(time=time_l, time2=time_r, type = "interval2") ~ txgrade, 
-  #         ~ txgrade,
-  #         data = dset_sub)
-  # fit_cure <- smcure(Surv(time=time_l, time2=time_r, type = "interval2")~txgrade+dxpsa+dxage,
-  #        cureform=~dxpsa+dxage,
-  #        data=dset_sub, model="ph", nboot = 100)
-  # printsmcure(fit_cure)
-  # predm <- predictsmcure(fit_cure,newX=c(0,1),newZ=c(0,1), model = "ph")
-  # plotpredictsmcure(predm)
-  # flexsurvcure(Surv(time=time_l, time2=time_r, type = "interval2")~txgrade+dxpsa+dxage,
-  #              data = dset_sub, dist="weibullPH", link = "logistic", mixture = TRUE,
-  #              anc = list(scale=~txgrade+dxpsa+dxage))
-  # 
-  # # The Generalized Odds Rate Mixture Cure model is fitted for interval censored survival data. 
-  # library(GORCure)
-  # fit<-GORMC(survfun=Surv(time=time_l, time2=time_r, type = "interval2")~txgrade+dxpsa+dxage,
-  #            curefun=~dxpsa+dxage,
-  #            data=dset_sub,r=0)
-  # ggsurvplot(fit, data = dset_sub)
-  
-  
+
   survfun <- Surv(time_l, time_r, type = 'interval2')~txpathgrade_cat+txage
   curefun <- ~txpathgrade_cat+txage
-  ests <- mxcureF(survfun, curefun, dset, bs_iter = NULL, dist = "weibull")
+  ests <- mxcureF(survfun, curefun, dset, bs_iter = 20, dist = "weibull")
   point_ests <- ests$par
   var <- round(diag(solve(-ests$hessian)), 6)
   # ests <- mxcureF(survfun, curefun, dset, bs_iter = 100, dist = "npmle")
