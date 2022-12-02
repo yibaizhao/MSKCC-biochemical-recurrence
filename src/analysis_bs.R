@@ -11,8 +11,9 @@ library(survival)
 library(purrrlyr)
 library(foreach)
 library(doParallel)
+library(stringr)
 
-datestamp <- "2022-11-29"
+datestamp <- "2022-11-30"
 
 filename <- "data_2022-09-13.csv"
 
@@ -152,9 +153,44 @@ bootstrap_analysis <- function(dset, B, numCores, saveit=TRUE){
   }
 }
 
-control <- function(filename){
-  dset <- read_data(filename)
-  bootstrap_analysis(dset, B=20, numCores=32, saveit=TRUE)
+plot_out <- function(dset, filename.bout, alpha.level, saveit){
+  bout <- read.csv(here("results", filename.bout))
+  out <- fit_vertical_model(dset, last_follow_up_years = seq(0.01, 15, 0.1))
+  bout.ci <- bout %>% 
+    group_by(across(c(-B, -CIF))) %>%
+    summarise(mean.CIF = mean(CIF, na.rm = TRUE),
+              sd.CIF = sd(CIF, na.rm = TRUE),
+              n = n()) %>%
+    mutate(se.CIF = sd.CIF / sqrt(n),
+           lower.ci.CIF = mean.CIF - qt(1 - (alpha.level / 2), n - 1) * se.CIF,
+           upper.ci.CIF = mean.CIF + qt(1 - (alpha.level / 2), n - 1) * se.CIF) %>%
+    ungroup()
+  out <- out %>% left_join(bout.ci)
+  gg <- out %>% 
+    ggplot(aes(x = tt_bcr_to_salvage_tx_year)) + 
+    geom_line(aes(y = CIF, colour = salvage_tx_type)) +
+    geom_ribbon(aes(ymin = lower.ci.CIF, ymax = upper.ci.CIF, fill = salvage_tx_type), alpha=0.5) +
+    facet_grid(tx_grade_group~tt_calendar_bcr_gp2) +
+    ylim(0,1) + xlab("Time (in Years) from BCR to salvage treatment") +
+    guides(fill=guide_legend(title="Salvage treatment"),
+           color=guide_legend(title="Salvage treatment")) +
+    theme_minimal()+
+    theme(legend.position="top")
+    
+  if(saveit){
+    filename <- str_glue('fig_bs_out_{datestamp}.png')
+    ggsave(here("results", filename),
+           plot = print(gg))
+  }
+  
 }
-control(filename = filename)
+
+control <- function(filename, filename.bout, saveit){
+  dset <- read_data(filename)
+  bootstrap_analysis(dset, B=100, numCores=32, saveit)
+  plot_out(dset, filename.bout, alpha.level=0.05, saveit)
+}
+control(filename = filename,
+        filename.bout = "bs_out_2022-11-30.csv",
+        saveit = TRUE)
 
