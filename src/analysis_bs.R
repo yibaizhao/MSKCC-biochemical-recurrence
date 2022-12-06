@@ -13,7 +13,9 @@ library(foreach)
 library(doParallel)
 library(stringr)
 
-datestamp <- "2022-11-30"
+set.seed(100)
+
+datestamp <- "2022-12-06"
 
 filename <- "data_2022-09-13.csv"
 
@@ -92,9 +94,10 @@ integrand <- function(t, df_new, fun_pi, fun_ft, trt_type){
                        tx_age=df_new$tx_age,
                        tt_calendar_bcr_gp2=df_new$tt_calendar_bcr_gp2,
                        tt_bcr=df_new$tt_bcr,
-                       tx_tstage_gp=df_new$tx_tstage_gp)
+                       tx_tstage_gp=df_new$tx_tstage_gp,
+                       salvage_tx_type = df_new$salvage_tx_type)
   pi <- predict(fun_pi, newdata=df_new,type="probs")
-  ft_risk <- predict(fun_ft, newdata=df_new, type='link')
+  ft_risk <- predict(fun_ft, newdata=df_new, type='link') # linear predictor
   shape <- 1/fun_ft$scale
   scale <- as.numeric(exp(ft_risk))
   f_t <- dweibull(x=t, shape=shape, scale=scale, log = FALSE)
@@ -139,17 +142,51 @@ fit_vertical_model <- function(dset, last_follow_up_years = seq(0.01, 15, 0.1)){
   }, .collate = "rows", .to = "CIF")
 }
 
-bootstrap_analysis <- function(dset, B, numCores, saveit=TRUE){
+bootstrap_analysis <- function(dset, 
+                               last_follow_up_years, 
+                               B, alpha.level,
+                               numCores, 
+                               plot = TRUE, saveit=TRUE){
   registerDoParallel(numCores)  # use multicore, set to the number of our cores
   bout <- foreach (i=1:B, .combine=rbind) %dopar% {
     bset <- dset %>% sample_frac(frac=1, replace = T)
-    bout_i <- fit_vertical_model(bset, last_follow_up_years = seq(0.01, 15, 0.1))
+    bout_i <- fit_vertical_model(bset, last_follow_up_years = last_follow_up_years)
     bout_i$B <- i
     bout_i
   }
+  
+  if(plot){
+    out <- fit_vertical_model(dset, last_follow_up_years = last_follow_up_years)
+    bout.ci <- bout %>% 
+      group_by(across(c(-B, -CIF))) %>%
+      summarise(mean.CIF = mean(CIF, na.rm = TRUE),
+                sd.CIF = sd(CIF, na.rm = TRUE),
+                n = n()) %>%
+      mutate(se.CIF = sd.CIF / sqrt(n),
+             lower.ci.CIF = mean.CIF - qt(1 - (alpha.level / 2), n - 1) * se.CIF,
+             upper.ci.CIF = mean.CIF + qt(1 - (alpha.level / 2), n - 1) * se.CIF) %>%
+      ungroup()
+    out_dt <- merge(out, bout.ci)
+    out_dt$tx_grade_group <- factor(out_dt$tx_grade_group, levels = c("<=6", "3+4", "4+3", ">=8"))
+    gg <- out_dt %>% 
+      ggplot(aes(x = tt_bcr_to_salvage_tx_year)) + 
+      geom_line(aes(y = CIF, colour = salvage_tx_type)) +
+      geom_ribbon(aes(ymin = lower.ci.CIF, ymax = upper.ci.CIF, fill = salvage_tx_type), alpha=0.5) +
+      facet_grid(tx_grade_group~tt_calendar_bcr_gp2) +
+      ylim(0,1) + xlab("Time (in Years) from BCR to salvage treatment") +
+      guides(fill=guide_legend(title="Salvage treatment"),
+             color=guide_legend(title="Salvage treatment")) +
+      theme_minimal()+
+      theme(legend.position="top")
+  }
+  
   if(saveit){
-    filename <- str_glue('bs_out_{datestamp}.csv')
-    write.csv(bout, here("results", filename))
+    filename <- str_glue('bs_out_{B}_{datestamp}.csv')
+    write.csv(bout, here("results", filename), row.names = FALSE)
+    filename2 <- str_glue('fig_bs_out_{B}_{datestamp}.png')
+    ggsave(here("results", filename2),
+           plot = print(gg))
+    
   }
 }
 
@@ -158,6 +195,9 @@ plot_out <- function(dset, filename.bout, alpha.level, saveit){
   out <- fit_vertical_model(dset, last_follow_up_years = seq(0.01, 15, 0.1))
   bout.ci <- bout %>% 
     group_by(across(c(-B, -CIF))) %>%
+    # group_by(tx_age, tt_bcr, tx_tstage_gp, 
+    #          tt_bcr_to_salvage_tx_year, tx_grade_group, 
+    #          tt_calendar_bcr_gp2, salvage_tx_type) %>%
     summarise(mean.CIF = mean(CIF, na.rm = TRUE),
               sd.CIF = sd(CIF, na.rm = TRUE),
               n = n()) %>%
@@ -165,8 +205,10 @@ plot_out <- function(dset, filename.bout, alpha.level, saveit){
            lower.ci.CIF = mean.CIF - qt(1 - (alpha.level / 2), n - 1) * se.CIF,
            upper.ci.CIF = mean.CIF + qt(1 - (alpha.level / 2), n - 1) * se.CIF) %>%
     ungroup()
-  out <- out %>% left_join(bout.ci)
-  gg <- out %>% 
+  out_dt <- merge(out, bout.ci)
+  out_dt$tx_grade_group <- factor(out_dt$tx_grade_group, levels = c("<=6", "3+4", "4+3", ">=8"))
+  # out <- out %>% left_join(bout.ci)
+  gg <- out_dt %>% 
     ggplot(aes(x = tt_bcr_to_salvage_tx_year)) + 
     geom_line(aes(y = CIF, colour = salvage_tx_type)) +
     geom_ribbon(aes(ymin = lower.ci.CIF, ymax = upper.ci.CIF, fill = salvage_tx_type), alpha=0.5) +
@@ -185,12 +227,14 @@ plot_out <- function(dset, filename.bout, alpha.level, saveit){
   
 }
 
-control <- function(filename, filename.bout, saveit){
+control <- function(filename, B, saveit){
   dset <- read_data(filename)
-  bootstrap_analysis(dset, B=100, numCores=32, saveit)
-  plot_out(dset, filename.bout, alpha.level=0.05, saveit)
+  bootstrap_analysis(dset, last_follow_up_years = seq(0.01, 15, 0.1), 
+                     B=B, alpha.level = 0.05,
+                     numCores=32, saveit)
+  # plot_out(dset, filename.bout, alpha.level=0.05, saveit)
 }
 control(filename = filename,
-        filename.bout = "bs_out_2022-11-30.csv",
+        B = 2,
         saveit = TRUE)
 
