@@ -1,0 +1,292 @@
+---
+title: "Prediction model at baseline"
+author: "Yibai Zhao"
+date: "2023-03-07"
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: true
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: false
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+library(survival)
+library(survminer)
+```
+
+# Load data
+
+-   Exclusion/inclusion criteria:
+
+    -   include subjects who have biochemical recurrence (BCR) at least 3 month after prostatectomy (RP)
+    -   exclude subjects who have metastasis before BCR
+    -   exclude patients having chemo therapy, N=7
+    -   exclude patients having adjuvant treatment (treatment within 6 month and before BCR), N=78
+    -   exclude patients receiving salvage treatment earlier than BCR, N=~55
+
+```{r}
+data <- read.csv("/Volumes/home/MSKCC-biochemical-recurrence/data/data_2023-01-13.csv")
+head(data)
+```
+
+# Data Dictionary
+
+| Variable Name            | Definition                                                  | Notes                                       |
+|-----------------|--------------------------------|-----------------------|
+| `ptid`                   | Patient ID                                                  |                                             |
+| `race`                   | Patient race                                                |                                             |
+| `bmi`                    | Body Mass Index (BMI)                                       |                                             |
+| `cci`                    | Charlson Comorbidity Index (CCI)                            |                                             |
+| `dx_psa`                 | Last PSA before RP                                          |                                             |
+| `tx_age`                 | Age at RP                                                   |                                             |
+| `tx_year`                | Year of RP                                                  |                                             |
+| `tx_type`                | RP type                                                     | RP / LP / RALP                              |
+| `tx_grade`               | Pathological Gleason sum                                    |                                             |
+| `tx_tstage`              | Pathological T stage                                        |                                             |
+| `tt_bcr`                 | Time to BCR                                                 | 2 rises of \>=0.1 starting 42 days post RP  |
+| `tt_calendar_bcr`        | Calendar year of time to BCR                                |                                             |
+| `bcr_psa`                | PSA at BCR                                                  |                                             |
+| `tt_salvage_tx`          | Time to salvage treatment                                   |                                             |
+| `salvage_tx_type`        | Salvage treatment type                                      | Chemo / Hormones / RT / `NA` (No treatment) |
+| `tt_calendar_salvage_tx` | Calendar year of time to salvage treatment                  |                                             |
+| `tt_bcr_to_salvage_tx`   | Time (in month) from BCR to salvage treatment               |                                             |
+| `outcome`                | Whether received salvage treatment within 6 month after BCR | 1-Received, 0-Not received                  |
+
+: Data Dictionary
+
+Note: Variable names have been renamed from original raw data set.
+
+# Data preprocessing
+```{r}
+# 0. Filter out "Chemo" and patients having adjuvant treatment
+data <- data %>% filter(salvage_tx_type != "Chemo" | is.na(salvage_tx_type))
+data <- data %>% filter(is.na(tt_adjuvant_tx))
+# 1. Categorization
+data <- data %>%
+  mutate(tx_grade_gp = case_when(
+    tx_grade == "6" ~ "<=6",
+    tx_grade %in% c("8", "9", "10") ~ ">7",
+    TRUE ~ tx_grade
+  ),
+  tx_grade_gp = factor(tx_grade_gp, levels = c("<=6", "3+4", "4+3", ">7")))
+
+data <- data %>% 
+  mutate(tx_tstage_gp = case_when(
+    grepl("T2|T0", tx_tstage) ~ "<=T2",
+    grepl("T3", tx_tstage) ~ "T3",
+    grepl("T4", tx_tstage) ~ "T4"
+  ))
+
+data <- data %>%
+  mutate(race_gp = case_when(
+    grepl("Asian|Other", race) ~ "Other",
+    TRUE ~ race),
+    # 2. Race="White" as baseline
+    race_gp = factor(race_gp, levels = c("White", "Black", "Other")))
+
+# 3. Reorer therapy factor
+data <- data %>%
+  mutate(across(salvage_tx_type, ~ifelse(is.na(tt_calendar_salvage_tx), "None", .)),
+         salvage_tx_type = factor(salvage_tx_type, levels = c("None", "Hormones", "RT", "Hormones + RT")))
+# age group
+data <- data %>%
+  mutate(tx_age_gp = cut(tx_age, c(0, 55, 70,100)))
+# Categorize calendar year
+data <- data %>%
+  mutate(
+    across(matches("calendar|year"), ~ifelse(.>= 2001 & .<=2003, "2001-2003",
+                                        ifelse(.>= 2004 & .<=2006, "2004-2006",
+                                               ifelse(.>= 2007 & .<=2009, "2007-2009",
+                                                      ifelse(.>= 2010 & .<=2012, "2010-2012",
+                                                             ifelse(.>= 2013 & .<=2015, "2013-2015",
+                                                                    ifelse(.>= 2016 & .<=2018, "2016-2018",
+                                                                           ifelse(.>= 2019 & .<=2021, "2019-2021", NA))))))),
+           .names = "{col}_gp"),
+    tt_calendar_bcr_gp2 = ifelse(tt_calendar_bcr >= 2001 & tt_calendar_bcr <= 2005, "2001-2005",
+                                      ifelse(tt_calendar_bcr > 2005 & tt_calendar_bcr <= 2010, "2006-2010",
+                                             ifelse(tt_calendar_bcr > 2010 & tt_calendar_bcr <= 2015, "2011-2015",
+                                                    ifelse(tt_calendar_bcr > 2015 & tt_calendar_bcr <= 2021, "2016-2021", NA)))),
+    across(matches("calendar|year"), ~factor(.)))
+# if no salvage treatment, then tt_salvage_tx=tt_last_fu
+data <- data %>% mutate(across(tt_salvage_tx, ~case_when(salvage_tx_type == "None" ~ tt_last_fu,
+                                                         TRUE ~ .)))
+# time(month) from bcr to salvage treatment
+data <- data %>% mutate(tt_bcr_to_salvage_tx = tt_salvage_tx-tt_bcr)
+
+# categorize comobility
+data <- data %>%
+  mutate(cci_gp = case_when(cci == 0 ~ "0",
+                            cci <= 2 ~ "1-2",
+                            TRUE ~ "3+")
+         )
+
+# indicator for immediate (trt within 6 mo) or late treatment (trt after 6 mo)
+data <- data %>%
+  mutate(salvage_tx_6mo = factor(case_when(tt_bcr_to_salvage_tx<=6 ~ "Immediate treatment",
+                                    TRUE ~ "Late treatment")))
+```
+
+# Data Exploration
+
+## Baseline Characteristics
+
+```{r}
+# install.packages("gtsummary")
+library(gtsummary)
+data %>%
+  dplyr::select(race, bmi, cci_gp, tx_age, tx_grade_gp, tx_tstage_gp, sms, lni, ln_pos_count, salvage_tx_type, tt_bcr, tt_salvage_tx, tt_last_fu, tt_mets, tt_death, death_type, salvage_tx_6mo) %>%
+  tbl_summary(by = salvage_tx_6mo, missing = "no") %>%
+  add_n() %>%
+  add_p() %>% 
+  modify_header(label = "**Variable**") #%>%
+  # bold_labels() %>%
+  # as_kable_extra(format = "latex")
+```
+
+## Histogram of time from BCR to salvage treatment for those received treatment after 6mo.
+```{r}
+data %>%
+  filter(tt_bcr_to_salvage_tx>6) %>%
+  ggplot(aes(x=tt_bcr_to_salvage_tx/12)) + 
+  geom_histogram() +
+  xlab("Time (in year) from BCR to Salvage Treatment")
+```
+
+# Regression
+
+
+## Time to metastasis and death by immediate treatment VS late treatment
+```{r}
+# time to metastasis
+KM_fit_mets_tx <- survfit(Surv((tt_mets-tt_bcr)/12, !is.na(tt_mets))~salvage_tx_6mo, data = data)
+ggsurvplot(KM_fit_mets_tx, 
+           data = data, 
+           legend = "right", 
+           legend.labs = levels(data$salvage_tx_6mo),
+           legend.title = "",
+           xlab = "Time (in years) from BCR to metastasis")
+# time to PCa death
+KM_fit_death_pca_tx <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Prostate Cancer Death")~salvage_tx_6mo, data = data)
+ggsurvplot(KM_fit_death_pca_tx, 
+           data = data, 
+           legend = "right", 
+           legend.labs = levels(data$salvage_tx_6mo),
+           legend.title = "",
+           xlab = "Time (in years) from BCR to PCa death")
+# time to Other death
+KM_fit_death_other_tx <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Other Cause Death")~salvage_tx_6mo, data = data)
+ggsurvplot(KM_fit_death_other_tx, 
+           data = data, 
+           legend = "right", 
+           legend.labs = levels(data$salvage_tx_6mo),
+           legend.title = "",
+           xlab = "Time (in years) from BCR to Other death")
+
+```
+
+## Time to PCa death stratify by Gleason grade and T stage by immediate treatment VS late treatment
+
+```{r}
+# grade
+data_KM <- data %>%
+  drop_na(tx_grade_gp, tx_tstage_gp) %>%
+  select(tt_death, tt_bcr, death_type, salvage_tx_6mo, tx_grade_gp, tx_tstage_gp) 
+data_KM_grade <- data_KM %>% 
+  filter(tx_grade_gp!="<=6")
+# data_KM <- data_KM %>% mutate(tx_grade_gp = factor(tx_grade_gp))
+KM_fit_death_pca_tx_grade <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Prostate Cancer Death")~salvage_tx_6mo, data = data_KM_grade)
+ggsurvplot(KM_fit_death_pca_tx_grade, data_KM_grade, 
+                     facet.by = "tx_grade_gp",
+                     xlab = "Time (in years) from BCR to PCa death")
+data_KM_grade <- data_KM %>% 
+  filter(tx_grade_gp=="<=6")
+# data_KM <- data_KM %>% mutate(tx_grade_gp = factor(tx_grade_gp))
+KM_fit_death_pca_tx_grade <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Prostate Cancer Death")~salvage_tx_6mo, data = data_KM_grade)
+ggsurvplot(KM_fit_death_pca_tx_grade, data_KM_grade,
+           facet.by = "tx_grade_gp",
+           xlab = "Time (in years) from BCR to PCa death")
+
+# T stage
+data_KM_tstage <- data_KM %>% 
+  filter(tx_tstage_gp!="<=T2")
+KM_fit_death_pca_tx_tstage <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Prostate Cancer Death")~salvage_tx_6mo, data = data_KM_tstage)
+ggsurvplot(KM_fit_death_pca_tx_tstage, data_KM_tstage, 
+                     facet.by = "tx_tstage_gp",
+                     xlab = "Time (in years) from BCR to PCa death")
+data_KM_tstage <- data_KM %>% 
+  filter(tx_tstage_gp=="<=T2")
+KM_fit_death_pca_tx_tstage <- survfit(Surv((tt_death-tt_bcr)/12, death_type=="Prostate Cancer Death")~salvage_tx_6mo, data = data_KM_tstage)
+ggsurvplot(KM_fit_death_pca_tx_tstage, data_KM_tstage, 
+                     facet.by = "tx_tstage_gp",
+                     xlab = "Time (in years) from BCR to PCa death")
+
+```
+
+# Landmark Analysis
+Event status: 0-censoring; 1-if treatment after BCR; 2-metastasis; 3-death
+```{r}
+# filter only non-immediate treatment
+data_non6mo <- data %>% filter(tt_bcr_to_salvage_tx>6)
+# replace NA with Inf
+data_non6mo <- data_non6mo %>%
+  mutate(tt_bcr_mets = tt_mets-tt_bcr,
+         tt_bcr_death = tt_death-tt_bcr,
+         tt_bcr_last_fu = tt_last_fu-tt_bcr) %>% 
+  mutate_at(vars(tt_bcr_mets, tt_bcr_death, tt_bcr_last_fu), ~replace_na(., Inf))
+# event status
+data_non6mo <- data_non6mo %>%
+         mutate(event_status=case_when(salvage_tx_type!="None" ~ 1,
+                                       (salvage_tx_type=="None"&tt_bcr_mets<=tt_bcr_last_fu&tt_bcr_mets<tt_bcr_death) ~ 2,
+                                  (salvage_tx_type=="None"&tt_bcr_death<=tt_bcr_last_fu&tt_bcr_death<tt_bcr_mets) ~ 3,
+                              (salvage_tx_type=="None"&tt_bcr_last_fu<tt_bcr_mets&tt_bcr_last_fu< tt_bcr_death) ~ 0))
+# event time
+data_non6mo <- data_non6mo %>% rowwise() %>% mutate(event_time=min(tt_bcr_to_salvage_tx, tt_bcr_mets, tt_bcr_death, tt_bcr_last_fu)) %>% unnest(event_time)
+```
+
+```{r}
+library(Landmarking)
+## load PSA data
+data_psa <- readRDS("/Volumes/home/MSKCC-biochemical-recurrence/data/psa_test_data.rds")
+data_psa$ptid <- as.numeric(data_psa$ptid)
+attr(data_psa$psa, 'problems') <- NULL
+data_all <- data_non6mo %>% left_join(data_psa, by = 'ptid')
+```
+
+
+```{r}
+## fit linear mixed effects landmark model
+data_all2 <- data_all %>% filter(event_status!=3)
+data_all2 <- data_all2 %>% mutate(fixed_effects_time=tt_bcr-tx_time_dx)
+data_model_landmark_LME <-
+  fit_LME_landmark(
+    data_long = data_all2,
+    x_L = c(0, 15, 20),
+    x_hor = c(5, 15, 20),
+    k = 5,
+    fixed_effects = c("tx_grade_gp", "tx_tstage_gp"),
+    fixed_effects_time = c("fixed_effects_time"), 
+    random_effects = c("psa"),
+    random_effects_time = c("time"),
+    individual_id = "ptid",
+    standardise_time = TRUE,
+    lme_control = nlme::lmeControl(maxIter =
+                                     100, msMaxIter = 100),
+    event_time = "event_time",
+    event_status = "event_status",
+    survival_submodel = "cause_specific")
+
+```
+
