@@ -1,0 +1,544 @@
+---
+title: "Prediction model using landmark analysis"
+author: "Yibai Zhao, Chihyun Lee"
+date: "2023-05-02"
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: true
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: false
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+library(survival)
+library(survminer)
+library(foreach)
+library(doParallel)
+library(gridExtra)
+library(gtsummary)
+registerDoParallel(8) 
+```
+
+# Load data
+
+-   exclusion criteria:
+
+    -   exclude subjects who didn't have biochemical recurrence (BCR), N=12495
+    -   exclude subjects having BCR within 3 month after prostatectomy (RP), N=896
+    -   exclude subjects having metastasis within 6 month of RP OR having metastasis before BCR, N=195
+    -   exclude subjects having chemo therapy, N=10
+    -   exclude subjects having adjuvant treatment (treatment within 6 month and before BCR), N=97
+
+```{r}
+data <- read.csv("/Volumes/home/MSKCC-biochemical-recurrence/data/data_2023-04-25.csv")
+head(data)
+```
+
+# Data Dictionary
+
+| Variable Name            | Definition                                                  | Notes                                       |
+|-----------------|--------------------------------|-----------------------|
+| `ptid`                   | Patient ID                                                  |                                             |
+| `race`                   | Patient race                                                |                                             |
+| `cci`                    | Charlson Comorbidity Index (CCI)                            |                                             |
+| `sms`                    | Surgical margins                                            |                                             |
+| `lni`                    | Lymph node involvement                                      |                                             |
+| `dx_psa`                 | Last PSA before RP                                          |                                             |
+| `tx_age`                 | Age at RP                                                   |                                             |
+| `tx_year`                | Year of RP                                                  |                                             |
+| `tx_type`                | RP type                                                     | RP / LP / RALP                              |
+| `tx_grade`               | Pathological Gleason sum                                    |                                             |
+| `tx_tstage`              | Pathological T stage                                        |                                             |
+| `tt_bcr`                 | Time to BCR                                                 | 2 rises of \>=0.1 starting 42 days post RP  |
+| `tt_calendar_bcr`        | Calendar year of time to BCR                                |                                             |
+| `bcr_psa`                | PSA at BCR                                                  |                                             |
+| `tt_salvage_tx`          | Time to salvage treatment                                   |                                             |
+| `salvage_tx_type`        | Salvage treatment type                                      | Chemo / Hormones / RT / `NA` (No treatment) |
+| `tt_calendar_salvage_tx` | Calendar year of time to salvage treatment                  |                                             |
+| `tt_bcr_to_salvage_tx`   | Time (in month) from BCR to salvage treatment               |                                             |
+| `outcome`                | Whether received salvage treatment within 6 month after BCR | 1-Received, 0-Not received                  |
+
+: Data Dictionary
+
+Note: Variable names have been renamed from original raw data set.
+
+# Data preprocessing
+```{r}
+# 0. Filter out "Chemo" and patients having adjuvant treatment
+data <- data %>% filter(salvage_tx_type != "Chemo" | is.na(salvage_tx_type))
+data <- data %>% filter(is.na(tt_adjuvant_tx))
+# 1. Categorization
+data <- data %>%
+  mutate(tx_grade = factor(tx_grade, levels = c("6", "3+4", "4+3", "8", "9", "10")))
+data <- data %>% 
+  mutate(tx_tstage_group = case_when(
+    grepl("T2|T0", tx_tstage) ~ "<=T2",
+    grepl("T3", tx_tstage) ~ "T3",
+    grepl("T4", tx_tstage) ~ "T4"
+  ))
+
+data <- data %>%
+  mutate(race_group = case_when(
+    grepl("Asian|Other", race) ~ "Other",
+    TRUE ~ race),
+    # 2. Race="White" as baseline
+    race_group = factor(race_group, levels = c("White", "Black", "Other")))
+
+# 3. Reorder therapy factor
+data <- data %>%
+  mutate(across(salvage_tx_type, ~ifelse(is.na(tt_calendar_salvage_tx), "None", .)),
+         salvage_tx_type = factor(salvage_tx_type, levels = c("None", "Hormones", "RT", "Hormones + RT")))
+# age group
+data <- data %>%
+  mutate(tx_age_gp = cut(tx_age, c(0, 55, 70,100)))
+# Categorize calendar year
+data <- data %>%
+  mutate(
+    across(matches("calendar|year"), ~ifelse(.>= 2001 & .<=2003, "2001-2003",
+                                        ifelse(.>= 2004 & .<=2006, "2004-2006",
+                                               ifelse(.>= 2007 & .<=2009, "2007-2009",
+                                                      ifelse(.>= 2010 & .<=2012, "2010-2012",
+                                                             ifelse(.>= 2013 & .<=2015, "2013-2015",
+                                                                    ifelse(.>= 2016 & .<=2018, "2016-2018",
+                                                                           ifelse(.>= 2019 & .<=2021, "2019-2021", NA))))))),
+           .names = "{col}_gp"),
+    tt_calendar_bcr_gp2 = ifelse(tt_calendar_bcr >= 2001 & tt_calendar_bcr <= 2005, "2001-2005",
+                                      ifelse(tt_calendar_bcr > 2005 & tt_calendar_bcr <= 2010, "2006-2010",
+                                             ifelse(tt_calendar_bcr > 2010 & tt_calendar_bcr <= 2015, "2011-2015",
+                                                    ifelse(tt_calendar_bcr > 2015 & tt_calendar_bcr <= 2021, "2016-2021", NA)))),
+    across(matches("calendar|year"), ~factor(.)))
+# if no salvage treatment, then tt_salvage_tx=tt_last_fu
+data <- data %>% mutate(across(tt_salvage_tx, ~case_when(salvage_tx_type == "None" ~ tt_last_fu,
+                                                         TRUE ~ .)))
+# time(month) from bcr to salvage treatment
+data <- data %>% mutate(tt_bcr_to_salvage_tx = tt_salvage_tx-tt_bcr)
+
+# categorize comobility
+data <- data %>%
+  mutate(cci_gp = case_when(cci == 0 ~ "0",
+                            cci <= 2 ~ "1-2",
+                            TRUE ~ "3+")
+         )
+
+# indicator for immediate (trt within 6 mo) or late treatment (trt after 6 mo)
+data <- data %>%
+  mutate(salvage_tx_6mo = factor(case_when(tt_bcr_to_salvage_tx<=6 ~ "Immediate treatment",
+                                    TRUE ~ "Late treatment")),
+         salvage_tx_6mo = as.numeric(salvage_tx_6mo)-1) # 0-early trt, 1-late trt
+# drop those died before receiving salvage treatment
+# data <- data %>% filter(tt_death>tt_salvage_tx | is.na(tt_death))
+#
+# data %>% filter(salvage_tx_6mo==0) # 1009
+# data %>% filter(salvage_tx_6mo==0 & tt_mets-tt_bcr<=6) # 51
+# data %>% filter(salvage_tx_6mo==0 & tt_death-tt_bcr<=6) # 4 other death
+# data %>% filter(salvage_tx_6mo==0 & tt_mets<tt_salvage_tx) # 37
+# summary(data$tt_bcr_to_salvage_tx[data$salvage_tx_6mo==0])
+
+# drop ptid=46427 due to 93-year of follow-up from RP
+data <- data %>% filter(ptid!=46427)
+```
+
+
+# Landmark Analysis
+Inclusion: both immediate and late treatment groups.
+
+Event status: 0-censoring; 1-death
+Event status2: 0-censoring; 2-metastasis
+```{r}
+# replace NA with Inf
+data_landmk <- data %>%
+  mutate(tt_bcr_yr = tt_bcr/12,
+         tt_bcr_to_salvage_tx_yr = (tt_bcr_to_salvage_tx)/12,
+         tt_bcr_mets_yr = (tt_mets-tt_bcr)/12,
+         tt_bcr_death_yr = (tt_death-tt_bcr)/12,
+         tt_bcr_last_fu_yr = (tt_last_fu-tt_bcr)/12) %>% 
+  mutate_at(vars(tt_bcr_mets_yr, tt_bcr_death_yr, tt_bcr_last_fu_yr), ~replace_na(., Inf))
+# event time and status
+data_landmk <- data_landmk %>%
+         mutate(tt_event_death = ifelse(is.infinite(tt_bcr_death_yr), tt_bcr_last_fu_yr, tt_bcr_death_yr),
+                tt_event_mets = ifelse(is.infinite(tt_bcr_mets_yr), tt_bcr_last_fu_yr, tt_bcr_mets_yr),
+                status_event_death = as.numeric(!is.infinite(tt_bcr_death_yr)),
+                status_event_PCa = status_event_death==1 & death_type=="Prostate Cancer Death",
+                status_event_other = status_event_death==1 & death_type=="Other Cause Death",
+                status_event_mets = as.numeric(!is.infinite(tt_bcr_mets_yr))) # double check with Lukas
+
+           # tt_event_death = ifelse(tt_bcr_last_fu_yr<tt_bcr_death_yr, tt_bcr_last_fu_yr, tt_bcr_death_yr),
+           #      tt_event_mets = ifelse(tt_bcr_last_fu_yr<tt_bcr_mets_yr, tt_bcr_last_fu_yr, tt_bcr_mets_yr),
+           #      status_event_death = as.numeric(!is.infinite(tt_bcr_death_yr)&(tt_bcr_last_fu_yr>=tt_bcr_death_yr)),
+           #      status_event_mets = as.numeric(!is.infinite(tt_bcr_mets_yr)&(tt_bcr_last_fu_yr>=tt_bcr_mets_yr))) 
+# data_landmk %>% select(ptid, tt_bcr_death_yr, tt_bcr_last_fu_yr, tt_event_death, status_event_death, tt_bcr_to_salvage_tx_yr, salvage_tx_type) %>% View
+# indicator of salvage treatment
+data_landmk <- data_landmk %>%
+  mutate(ind_salvage_trt = ifelse(salvage_tx_type!="None"&!is.na(salvage_tx_type), 1, 0),
+         ind_salvage_trt_6mo = ifelse((ind_salvage_trt==1)&(tt_bcr_to_salvage_tx_yr<0.5), 1, 0))
+```
+
+<!-- ## Censoring before death -->
+<!-- ```{r} -->
+<!-- data_landmk %>% filter(tt_bcr_last_fu_yr<tt_bcr_death_yr & !is.infinite(tt_bcr_death_yr)) %>% select(ptid, tt_bcr_to_salvage_tx_yr, salvage_tx_type, tt_bcr_last_fu_yr, tt_bcr_death_yr) -->
+<!-- # censoring before having treatment and died after (ignoring) -->
+<!-- data_landmk %>% filter(!is.infinite(tt_bcr_death_yr) & tt_bcr_last_fu_yr<tt_bcr_death_yr & salvage_tx_type=="None") %>% select(ptid, tt_bcr_to_salvage_tx_yr, salvage_tx_type, tt_bcr_last_fu_yr, tt_bcr_death_yr) -->
+<!-- # having treatment before censoring and died after -->
+<!-- data_landmk %>% filter(tt_bcr_last_fu_yr<tt_bcr_death_yr & salvage_tx_type!="None" & !is.infinite(tt_bcr_death_yr)) %>% select(ptid, tt_bcr_to_salvage_tx_yr, salvage_tx_type, tt_bcr_last_fu_yr, tt_bcr_death_yr) -->
+<!-- ``` -->
+
+
+
+## Propensity score and IPW
+```{r}
+data_landmk <- data_landmk %>%
+  mutate(age_bcr=tx_age+tt_bcr/12)
+data_landmk <- data_landmk %>% drop_na(age_bcr,bmi,cci,tx_grade,tx_tstage_group,sms,lni,bcr_psa,dx_psa,tt_bcr_yr)
+# logistic regression to find significant covariates, covariates with NA
+fit_logit <- glm(ind_salvage_trt_6mo~age_bcr+bmi+cci+tx_grade+tx_tstage_group+sms+lni+bcr_psa+dx_psa+tt_bcr_yr, family = binomial(link='logit'), data = data_landmk)
+# fit_logit %>%
+#    tbl_regression(exponentiate = TRUE)
+# find propensity score
+data_landmk <- data_landmk %>%
+  mutate(glm_probs = predict(fit_logit, type="response"),
+         weights = ifelse(ind_salvage_trt_6mo==1, 1/glm_probs, 1/(1-glm_probs)))
+# Trimming approach to deal with extreme cases (PS close to 0 or 1)
+glm_probs_quantile <- quantile(data_landmk$glm_probs, c(.025, .975))
+data_landmk <- data_landmk %>% 
+  mutate(glm_probs = ifelse(glm_probs<glm_probs_quantile[1], glm_probs_quantile[1], glm_probs),
+         glm_probs = ifelse(glm_probs>glm_probs_quantile[2], glm_probs_quantile[2], glm_probs))
+# data_landmk %>% select(ptid, glm_probs, weights) %>% View
+```
+
+https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html#Part_2:_Landmark_Analysis_and_Time_Dependent_Covariates
+```{r}
+# Subset population for those followed at least until landmark time
+data_landmk_0.5 <- 
+  data_landmk %>% 
+  filter(tt_event_death > 0.5) 
+
+# Calculate follow-up time from landmark and apply traditional methods
+data_landmk_0.5 <- 
+  data_landmk_0.5 %>% 
+  mutate(
+    tt_event_death = tt_event_death - 0.5,
+    tt_bcr_to_salvage_tx_yr = tt_bcr_to_salvage_tx_yr - 0.5
+    )
+
+```
+There are `r data_landmk %>% filter(tt_event_death <= 0.5) %>% count %>% as.numeric()` subjects who censored or died whithin 6-month after BCR.
+
+## Time to all death
+### KM plot
+```{r}
+library(ggsurvfit)
+survfit(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+survfit(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+```
+
+### Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Adding IPW weights to Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt_6mo, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_death) ~ ind_salvage_trt, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Incorperate time-dependent covariate
+
+```{r}
+# create dataset with time-dependent covariates
+covs <- c("age_bcr", "cci", "tx_grade", "tx_tstage_group", "sms", "lni", "bcr_psa", "dx_psa", "tt_bcr_yr", "weights")
+td_dat <- 
+  tmerge(
+    data1 = data_landmk_0.5 %>% select(ptid, tt_event_death, status_event_death, ind_salvage_trt_6mo, all_of(covs)), 
+    data2 = data_landmk_0.5 %>% select(ptid, tt_event_death, status_event_death, tt_bcr_to_salvage_tx_yr, ind_salvage_trt, ind_salvage_trt_6mo, all_of(covs)), 
+    id = ptid, 
+    death = event(tt_event_death, status_event_death),
+    salvage_tx = tdc(tt_bcr_to_salvage_tx_yr)
+    )
+coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ salvage_tx+ind_salvage_trt_6mo, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ salvage_tx+ind_salvage_trt_6mo+
+    age_bcr+cci+tx_grade+tx_tstage_group+sms+lni+bcr_psa+dx_psa+tt_bcr_yr, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+```
+
+## Time to Prostate Cancer Death
+### KM plot
+```{r}
+library(ggsurvfit)
+survfit(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+survfit(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+```
+
+### Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Adding IPW weights to Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt_6mo, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_PCa) ~ ind_salvage_trt, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Incorporate time-dependent covariates
+
+```{r}
+# create dataset with time-dependent covariates
+covs <- c("age_bcr", "cci", "tx_grade", "tx_tstage_group", "sms", "lni", "bcr_psa", "dx_psa", "tt_bcr_yr", "weights")
+td_dat <- 
+  tmerge(
+    data1 = data_landmk_0.5 %>% select(ptid, tt_event_death, status_event_PCa, ind_salvage_trt_6mo, all_of(covs)), 
+    data2 = data_landmk_0.5 %>% select(ptid, tt_event_death, status_event_PCa, tt_bcr_to_salvage_tx_yr, ind_salvage_trt, ind_salvage_trt_6mo, all_of(covs)), 
+    id = ptid, 
+    death = event(tt_event_death, status_event_PCa),
+    salvage_tx = tdc(tt_bcr_to_salvage_tx_yr)
+    )
+coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ salvage_tx+ind_salvage_trt_6mo, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ salvage_tx+ind_salvage_trt_6mo+
+    age_bcr+cci+tx_grade+tx_tstage_group+sms+lni+bcr_psa+dx_psa+tt_bcr_yr, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+```
+```{r}
+coxph(
+  Surv(time = tt_event_death, event = status_event_PCa) ~ tt(tt_bcr_to_salvage_tx_yr)+ind_salvage_trt+ind_salvage_trt_6mo, 
+  data = data_landmk_0.5,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+coxph(
+  Surv(time = tt_event_death, event = status_event_PCa) ~ tt(tt_bcr_to_salvage_tx_yr)+ind_salvage_trt_6mo, 
+  data = data_landmk_0.5,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+
+```
+
+
+### Predict survival
+```{r}
+# time to treatment
+fit_coxph <- coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ salvage_tx+ind_salvage_trt_6mo, 
+  data = td_dat,
+  ) 
+ptid <- 10358
+newdat <- td_dat %>% filter(ptid == !!ptid)
+ggsurvplot(survfit(fit_coxph, newdata = newdata, id = ptid), data = newdata)
+
+ptid <- 10358
+newdata1 <- data_landmk_0.5 %>% filter(ptid == !!ptid)
+newdata2 <- newdata1
+newdata2$ind_salvage_trt <- 0
+newdata2$ind_salvage_trt_6mo <- 0
+newdata2$ptid <- newdata1$ptid+10
+newdata <- rbind(newdata1, newdata2)
+newdata_td <- 
+  tmerge(
+    data1 = newdata %>% select(ptid, tt_event_death, status_event_PCa, ind_salvage_trt_6mo, all_of(covs)), 
+    data2 = newdata %>% select(ptid, tt_event_death, status_event_PCa, tt_bcr_to_salvage_tx_yr, ind_salvage_trt, ind_salvage_trt_6mo, all_of(covs)), 
+    id = ptid, 
+    death = event(tt_event_death, status_event_PCa),
+    salvage_tx = tdc(tt_bcr_to_salvage_tx_yr)
+    )
+ggsurvplot(survfit(fit_coxph, newdata = newdata_td, id = ptid), data = newdata_td)
+
+```
+
+## Time to Other Cause Death
+### KM plot
+```{r}
+library(ggsurvfit)
+survfit(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+survfit(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt, data = data_landmk_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+```
+
+### Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt_6mo, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt, data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Adding IPW weights to Cox PH
+```{r}
+coxph(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt_6mo, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_death, status_event_other) ~ ind_salvage_trt, 
+      weights = weights,
+      data = data_landmk_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+
+## Time to Metastasis
+```{r}
+# Subset population for those followed at least until landmark time
+data_landmk_mets_0.5 <- 
+  data_landmk %>% 
+  filter(tt_event_mets > 0.5 & tt_event_death > 0.5) 
+
+# Calculate follow-up time from landmark and apply traditional methods
+data_landmk_mets_0.5 <- 
+  data_landmk_mets_0.5 %>% 
+  mutate(
+    tt_event_mets = tt_event_mets - 0.5,
+    tt_bcr_to_salvage_tx_yr = tt_bcr_to_salvage_tx_yr - 0.5
+    )
+
+```
+
+There are `r data_landmk %>% filter(tt_event_mets <= 0.5 | tt_event_death <= 0.5) %>% count %>% as.numeric()` subjects who censored, died or had metastasis whithin 6-month after BCR.
+
+### KM plot
+```{r}
+library(ggsurvfit)
+survfit(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt_6mo, data = data_landmk_mets_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+survfit(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt, data = data_landmk_mets_0.5) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years from 6-month landmark",
+    y = "Overall survival probability"
+  ) +
+  add_risktable()
+```
+
+### Cox PH
+```{r}
+coxph(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt_6mo, data = data_landmk_mets_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt, data = data_landmk_mets_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Adding IPW weights to Cox PH
+```{r}
+coxph(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt_6mo, 
+      weights = weights,
+      data = data_landmk_mets_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+coxph(Surv(tt_event_mets, status_event_mets) ~ ind_salvage_trt, 
+      weights = weights,
+      data = data_landmk_mets_0.5) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+Incorperate time-dependent covariates
+
+```{r}
+# create dataset with time-dependent covariates
+covs <- c("age_bcr", "cci", "tx_grade", "tx_tstage_group", "sms", "lni", "bcr_psa", "dx_psa", "tt_bcr_yr", "weights")
+td_dat <- 
+  tmerge(
+    data1 = data_landmk_mets_0.5 %>% select(ptid, tt_event_mets, status_event_mets, ind_salvage_trt_6mo, all_of(covs)), 
+    data2 = data_landmk_mets_0.5 %>% select(ptid, tt_event_mets, status_event_mets, tt_bcr_to_salvage_tx_yr, ind_salvage_trt, ind_salvage_trt_6mo, all_of(covs)), 
+    id = ptid, 
+    mets = event(tt_event_mets, status_event_mets),
+    salvage_tx = tdc(tt_bcr_to_salvage_tx_yr)
+    )
+coxph(
+  Surv(time = tstart, time2 = tstop, event = mets) ~ salvage_tx+ind_salvage_trt_6mo, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+coxph(
+  Surv(time = tstart, time2 = tstop, event = mets) ~ salvage_tx+ind_salvage_trt_6mo+
+    age_bcr+cci+tx_grade+tx_tstage_group+sms+lni+bcr_psa+dx_psa+tt_bcr_yr, #cluster = ptid,
+  data = td_dat,
+  ) %>% 
+  tbl_regression(exp = TRUE)
+```
+
+Patient I
+```{r}
+ptid <- 10358
+```
+
