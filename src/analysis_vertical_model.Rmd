@@ -1,0 +1,674 @@
+---
+title: "Trend of salvage treatment after biochemical recurrence among patients received prostatectomy"
+author: "Yibai Zhao"
+date: "2023-09-13"
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: true
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: false
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+```
+
+# Introduction
+Salvage treatment can provide a potential cure for failure after primary treatment for localized prostate cancer. Studies investigated the trends and predictors of salvage treatment. They found patient age and Gleason scores are associated with type of salvage treatment. However, they didn't address the trend in timing of salvage treatment receipt and the factors that associated with it. In this study, we use a vertical model to estimate the time to receive salvage treatment.
+
+# Data and Method
+In a study of patients who received primary radical prostatectomy at Memorial Sloan Kettering Cancer Center, there are 16023 patients have BCR at least 3 moth after prostatectomy (RP). We exclude patients have metastasis within 6 month or before BCR (N=190), don't have BCR (N=12631). There are 3202 patients having biochemical recurrence (BCR). Among those, 2035 received salvage treatment, i.e. radiation (RT), hormones, hormones and RT. We also exclude patients receiving Chemo therapy (N=17).
+
+We use an alternative competing risks model vertical model and have different types of salvage treatment as competing risks to estimate the timing of receiving salvage treatment. The vertical model decomposes a joint model into two parts, one is time to receive salvage treatment, the other is the types of salvage treatment receipt condition on the time of salvage treatment. We fit a Weibull Cox PH model to estimate the time to receive salvage treatment and a multinomial logistic regression with a cubic spline as a function of types of salvage treatment receipt at each time point. 
+
+# Load data
+
+-   Exclusion/inclusion criteria:
+
+    -   include subjects who have biochemical recurrence (BCR) at least 3 month after prostatectomy (RP)
+    -   exclude subjects who have metastasis before BCR
+    -   exclude patients having chemo therapy
+    -   exclude patients having adjuvant treatment (treatment within 6 month and before BCR)
+
+```{r}
+data <- read.csv("/Volumes/home/MSKCC-biochemical-recurrence/data/data_2023-08-22.csv")
+head(data)
+```
+
+# Data Dictionary
+
+| Variable Name            | Definition                                                  | Notes                                       |
+|-----------------|--------------------------------|-----------------------|
+| `ptid`                   | Patient ID                                                  |                                             |
+| `race`                   | Patient race                                                |                                             |
+| `bmi`                    | Body Mass Index (BMI)                                       |                                             |
+| `cci`                    | Charlson Comorbidity Index (CCI)                            |                                             |
+| `dx_psa`                 | Last PSA before RP                                          |                                             |
+| `tx_age`                 | Age at RP                                                   |                                             |
+| `tx_year`                | Year of RP                                                  |                                             |
+| `tx_type`                | RP type                                                     | RP / LP / RALP                              |
+| `tx_grade`               | Pathological Gleason sum                                    |                                             |
+| `tx_tstage`              | Pathological T stage                                        |                                             |
+| `tt_bcr`                 | Time to BCR                                                 | 2 rises of \>=0.1 starting 42 days post RP  |
+| `tt_calendar_bcr`        | Calendar year of time to BCR                                |                                             |
+| `bcr_psa`                | PSA at BCR                                                  |                                             |
+| `tt_salvage_tx`          | Time to salvage treatment                                   |                                             |
+| `salvage_tx_type`        | Salvage treatment type                                      | Chemo / Hormones / RT / `NA` (No treatment) |
+| `tt_calendar_salvage_tx` | Calendar year of time to salvage treatment                  |                                             |
+| `tt_bcr_to_salvage_tx`   | Time (in month) from BCR to salvage treatment               |                                             |
+| `outcome`                | Whether received salvage treatment within 6 month after BCR | 1-Received, 0-Not received                  |
+
+: Data Dictionary
+
+Note: Variable names have been renamed from original raw data set.
+
+```{r}
+# 0. Filter out "Chemo" and patients having adjuvant treatment
+data <- data %>% filter(salvage_tx_type != "Chemo" | is.na(salvage_tx_type))
+data <- data %>% filter(is.na(tt_adjuvant_tx))
+# 1. Categorization
+data <- data %>%
+  mutate(tx_grade_gp = case_when(
+    tx_grade == "6" ~ "<=6",
+    tx_grade %in% c("8", "9", "10") ~ ">7",
+    TRUE ~ tx_grade
+  ),
+  tx_grade_gp = factor(tx_grade_gp, levels = c("<=6", "3+4", "4+3", ">7")))
+
+data <- data %>% 
+  mutate(tx_tstage_gp = case_when(
+    grepl("T2|T0", tx_tstage) ~ "<=T2",
+    grepl("T3", tx_tstage) ~ "T3",
+    grepl("T4", tx_tstage) ~ "T4"
+  ))
+
+data <- data %>%
+  mutate(race_gp = case_when(
+    grepl("Asian|Other", race) ~ "Other",
+    TRUE ~ race),
+    # 2. Race="White" as baseline
+    race_gp = factor(race_gp, levels = c("White", "Black", "Other")))
+
+# 3. Reorer therapy factor
+data <- data %>%
+  mutate(across(salvage_tx_type, ~ifelse(is.na(tt_calendar_salvage_tx), "None", .)),
+         salvage_tx_type = factor(salvage_tx_type, levels = c("None", "Hormones", "RT", "Hormones + RT")))
+# age group
+data <- data %>%
+  mutate(tx_age_gp = cut(tx_age, c(0, 55, 70,100)))
+# Categorize calendar year
+data <- data %>%
+  mutate(
+    across(matches("calendar|year"), ~ifelse(.>= 2001 & .<=2003, "2001-2003",
+                                        ifelse(.>= 2004 & .<=2006, "2004-2006",
+                                               ifelse(.>= 2007 & .<=2009, "2007-2009",
+                                                      ifelse(.>= 2010 & .<=2012, "2010-2012",
+                                                             ifelse(.>= 2013 & .<=2015, "2013-2015",
+                                                                    ifelse(.>= 2016 & .<=2018, "2016-2018",
+                                                                           ifelse(.>= 2019 & .<=2021, "2019-2021", NA))))))),
+           .names = "{col}_gp"),
+    tt_calendar_bcr_gp2 = ifelse(tt_calendar_bcr >= 2001 & tt_calendar_bcr <= 2005, "2001-2005",
+                                      ifelse(tt_calendar_bcr > 2005 & tt_calendar_bcr <= 2010, "2006-2010",
+                                             ifelse(tt_calendar_bcr > 2010 & tt_calendar_bcr <= 2015, "2011-2015",
+                                                    ifelse(tt_calendar_bcr > 2015 & tt_calendar_bcr <= 2021, "2016-2021", NA)))),
+    across(matches("calendar|year"), ~factor(.)))
+# if no salvage treatment, then tt_salvage_tx=tt_last_fu
+data <- data %>% mutate(across(tt_salvage_tx, ~case_when(salvage_tx_type == "None" ~ tt_last_fu,
+                                                         TRUE ~ .)))
+# time(month) from bcr to salvage treatment
+data <- data %>% mutate(tt_bcr_to_salvage_tx = tt_salvage_tx-tt_bcr)
+
+# categorize comobility
+data <- data %>%
+  mutate(cci_gp = case_when(cci == 0 ~ "0",
+                            cci <= 2 ~ "1-2",
+                            TRUE ~ "3+")
+         )
+
+                
+```
+
+# Data Exploration
+
+## Baseline Characteristics
+
+```{r}
+# install.packages("gtsummary")
+library(gtsummary)
+data %>%
+  dplyr::select(race, bmi, cci_gp, tx_age, tx_grade_gp, tx_tstage_gp, sms, lni, ln_pos_count, salvage_tx_type, tt_bcr, tt_salvage_tx, tt_last_fu) %>%
+  tbl_summary(by = "salvage_tx_type", missing = "no") %>%
+  add_n() %>%
+  add_p() %>% 
+  modify_header(label = "**Variable**") #%>%
+  # bold_labels() %>%
+  # as_kable_extra(format = "latex")
+
+```
+
+## Salvage treatment trends over calendar year
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+data_pct <- data %>%
+  drop_na(c("tt_calendar_salvage_tx_gp")) %>%
+  group_by(tt_calendar_salvage_tx_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_salvage_tx_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT"))) %>% 
+    ungroup
+data_pct <- as.data.frame(data_pct)
+
+data_pct %>%
+  ggplot(aes(tt_calendar_salvage_tx_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme(legend.position = "bottom")
+```
+
+## Salvage treatment trends over BCR calendar year including no treatment
+
+```{r}
+data_pct2 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct2 <- as.data.frame(data_pct2)
+
+data_pct2 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(fill=guide_legend(title = "Salvage Treatment Type")) +
+  xlab("BCR Calendar Year") + ylab("Percent")
+# ggsave(here("results", "tx_type_by_bcr_calendar_year.png"))
+
+```
+
+### Trend in immediate salvage treatment (within 6 month) receipt and type over calendar year
+```{r}
+data_pct2.1 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  filter(tt_bcr_to_salvage_tx<=6, salvage_tx_type!="None") %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct2.1 <- as.data.frame(data_pct2.1)
+
+data_pct2.1 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(fill=guide_legend(title = "Salvage Treatment Type")) +
+  xlab("BCR Calendar Year") + ylab("Percent")
+# ggsave(here("results", "tx_immediate_by_bcr_calendar_year.png"))
+
+```
+
+### Subset at least 3 years followup after BCR
+```{r}
+data_pct2.2 <- data %>%
+  filter(tt_last_fu-tt_bcr>=36 & tt_calendar_bcr_gp!="2019-2021") %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct2.2 <- as.data.frame(data_pct2.2)
+
+data_pct2.2 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = n_count), position = position_fill(vjust = 0.5)) +
+  theme(legend.position = "bottom")
+
+```
+
+#### Subset at least 3 years followup after BCR stratified by grade
+```{r}
+data_pct2.3 <- data %>%
+  filter(tt_last_fu-tt_bcr>=36 & tt_calendar_bcr_gp!="2019-2021") %>%
+  drop_na(tt_calendar_bcr_gp, salvage_tx_type, tx_grade_gp) %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type, tx_grade_gp) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp, tx_grade_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct2.3 <- as.data.frame(data_pct2.3)
+
+data_pct2.3 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = n_count), position = position_fill(vjust = 0.5)) +
+  facet_grid(tx_grade_gp~.) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(fill=guide_legend(title = "Salvage Treatment Type")) +
+  xlab("BCR Calendar Year") + ylab("Percent")
+
+# ggsave(here("results", "tx_type_by_bcr_grade.png"))
+
+```
+
+
+## Grade by calendar year
+
+```{r}
+data_pct3.2 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  group_by(tt_calendar_bcr_gp, tx_grade_gp) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           tx_grade_gp = factor(tx_grade_gp, levels = c("<=6", "3+4", "4+3", ">7"))) %>% 
+    ungroup
+data_pct3.2 <- as.data.frame(data_pct3.2)
+
+data_pct3.2 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(tx_grade_gp))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(fill=guide_legend(title = "Salvage Treatment Type")) +
+  xlab("BCR Calendar Year") + ylab("Percent")
+
+# ggsave(here("results", "grade_by_bcr.png"))
+```
+
+## T stage by calendar year
+
+```{r}
+data_pct4 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  group_by(tt_calendar_bcr_gp, tx_tstage_gp) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           tx_tstage_gp = factor(tx_tstage_gp, levels = c("<=T2", "T3", "T4"))) %>% 
+    ungroup
+data_pct4 <- as.data.frame(data_pct4)
+
+data_pct4 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(tx_tstage_gp))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme(legend.position = "bottom")
+```
+
+## Salvage treatment trends over calendar year within 6 month after BCR
+
+```{r}
+data_pct5 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  filter(tt_bcr_to_salvage_tx<=6) %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct5 <- as.data.frame(data_pct5)
+
+data_pct5 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme(legend.position = "bottom")
+```
+
+## Salvage treatment trends over calendar year within 1 year after BCR
+
+```{r}
+data_pct6 <- data %>%
+  drop_na(tt_calendar_bcr_gp) %>%
+  filter(tt_bcr_to_salvage_tx<=12) %>%
+  group_by(tt_calendar_bcr_gp, salvage_tx_type) %>% 
+  summarise(n_count = n()) %>%
+  group_by(tt_calendar_bcr_gp) %>%
+    mutate(pct =  round(100 *n_count/sum(n_count), 2),
+           salvage_tx_type = factor(salvage_tx_type, levels = c("Hormones", "RT", "Hormones + RT", "None"))) %>% 
+    ungroup
+data_pct6 <- as.data.frame(data_pct6)
+
+data_pct6 %>%
+  ggplot(aes(tt_calendar_bcr_gp, pct, fill = factor(salvage_tx_type))) +
+  geom_col(position = "fill") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_fill(vjust = 0.5)) +
+  theme(legend.position = "bottom")
+```
+
+# Regression
+
+## Time from BCR to salvage treatment
+
+```{r}
+library(survival)
+library(survminer)
+ggList <- list()
+KM_fit_grade <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~tx_grade_gp, data = data)
+ggList[[1]] <- ggsurvplot(KM_fit_grade, data = data, legend = "right", legend.labs = paste0("Grade:", levels(data$tx_grade_gp)))
+
+KM_fit_Tstage <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~tx_tstage_gp, data = data)
+ggList[[2]] <- ggsurvplot(KM_fit_Tstage, data = data, legend = "right", legend.labs = paste0("T Stage:", c("<=T2", "T3", "T4")))
+
+KM_fit_race <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~race_gp, data = data)
+ggList[[3]] <- ggsurvplot(KM_fit_race, data = data, legend = "right", legend.labs = paste0("Race:", levels(data$race_gp)))
+
+KM_fit_tt_bcr <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~tt_calendar_bcr_gp, data = data)
+ggList[[4]] <- ggsurvplot(KM_fit_tt_bcr, data = data, legend = "right", legend.labs = paste0("BCR:", levels(data$tt_calendar_bcr_gp)))
+
+# KM_fit_salvage_type <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~salvage_tx_type, data = data)
+# ggList[[5]] <- ggsurvplot(KM_fit_salvage_type, data = data, legend = "right")
+
+# Add age group
+KM_fit_tx_age <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~tx_age_gp, data = data)
+ggList[[5]] <-  ggsurvplot(KM_fit_tx_age, data = data, legend = "right", legend.labs = paste0("Age:", levels(data$tx_age_gp)))
+
+KM_fit_cci <- survfit(Surv(tt_bcr_to_salvage_tx/12, salvage_tx_type != "None")~cci_gp, data = data)
+ggList[[6]] <-  ggsurvplot(KM_fit_cci, data = data, legend = "right", legend.labs = paste0("Comobidity:", c("0", "1-2", "3+")))
+
+ggAll <- arrange_ggsurvplots(ggList,
+                    print = FALSE,
+                    ncol = 2, nrow = 3)
+ggAll
+# ggsave(here("results", "plot_KM.png"), ggAll, height = 8, width = 10)
+```
+
+## Vertical Model
+```{r}
+library(splines)
+library(nnet)
+upper_t <- seq(0.01, 15, 0.1)
+data <- data %>% mutate(tt_bcr_to_salvage_tx_year = tt_bcr_to_salvage_tx/12)
+data <- data %>% mutate(tt_bcr_to_salvage_tx_year=
+                          ifelse(tt_bcr_to_salvage_tx_year==0, tt_bcr_to_salvage_tx_year+0.001, tt_bcr_to_salvage_tx_year))
+data_trt <- data %>% dplyr::filter(salvage_tx_type!="None")
+data_trt <- data_trt %>% mutate(salvage_tx_type = factor(salvage_tx_type))
+```
+
+```{r}
+ggList_vm <- list()
+# estimate conditonal probability of receiving each treatment at time t
+mlog_spline <- multinom(salvage_tx_type ~ bs(tt_bcr_to_salvage_tx_year), data = data_trt)
+prob <- predict(mlog_spline, newdata=data.frame(tt_bcr_to_salvage_tx_year=upper_t),type="probs")
+gdset <- data.frame(time=upper_t, prob)
+gdset_long <- gdset %>% pivot_longer(cols = 2:4, 
+                                names_to = "Treatment",
+                                values_to = "Probability")
+ggList_vm[[1]] <- ggplot(data = gdset_long, aes(x=time, y=Probability, color=Treatment))+
+  geom_line() + 
+  ylab("Relative Hazard") + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+# ggsave(here("results", "plot_vm_relative_hazards.png"))
+# Assume T~Weibull, estimate density corresponding to the overall failure time distribution
+library(survival)
+## prioritize BCR time earlier if tt_bcr=tt_salvage_tx
+## if t=0, add 0.001
+fit <- survreg(Surv(tt_bcr_to_salvage_tx_year,salvage_tx_type!="None") ~ 1, data=data, dist = "weibull") # this is the survreg output model
+# There are multiple ways to parameterize a Weibull distribution. The survreg 
+# function embeds it in a general location-scale family, which is a 
+# different parameterization than the rweibull function, and often leads
+# to confusion.
+#   survreg's scale  =    1/(rweibull shape)
+#   survreg's intercept = log(rweibull scale)
+shape <- 1/fit$scale
+scale <- exp(fit$coefficients[1])
+f_t <- dweibull(x=upper_t, shape=shape, scale=scale, log = FALSE)
+
+
+# CIF
+integrand <- function(t, fun_pi, fun_ft, col_name){
+  pi <- predict(fun_pi, newdata=data.frame(tt_bcr_to_salvage_tx_year=t),type="probs")
+  shape <- 1/fun_ft$scale
+  scale <- exp(fun_ft$coefficients[1])
+  f_t <- dweibull(x=t, shape=shape, scale=scale, log = FALSE)
+  (pi*f_t)[,col_name]
+}
+CIF_Hormones <- sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="Hormones", lower = 0, upper = t)$value)
+CIF_RT <- sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="RT", lower = 0, upper = t)$value)
+CIF_Hormones_RT <- sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="Hormones + RT", lower = 0, upper = t)$value)
+
+out <- data.frame(time = upper_t, CIF_Hormones, CIF_RT, CIF_Hormones_RT)
+out <- out %>% pivot_longer(cols = 2:4,
+                            names_to = "Treatment",
+                            values_to = "CIF",
+                            names_prefix = "CIF_")
+ggList_vm[[2]] <- ggplot(data = out, aes(x=time, y=CIF, color=Treatment))+
+  geom_line() + ylim(0,1) + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+ggarrange(plotlist = ggList_vm, 
+          common.legend = TRUE,
+          labels = c("A", "B"),
+          ncol = 2, nrow = 1)
+# ggsave(here("results", "plot_vm_no_cov.png"), height = 8, width = 10)
+
+# covariates
+#calendar year BCR, grade, age at diagnosis, time from RP to BCR etc.
+
+```
+
+## Adding covariates
+Fixed covariates: age at diagnosis=63, time to bcr=13 month, T stage=T3
+
+### Calender year of BCR
+```{r}
+ggList_vm1 <- list()
+# estimate conditional probability of receiving each treatment at time t
+mlog_spline <- multinom(salvage_tx_type ~ bs(tt_bcr_to_salvage_tx_year) + tt_calendar_bcr_gp2+tx_age+tx_grade_group+tt_bcr+tx_tstage_gp, data = data_trt)
+data_cov <- data %>% select(tt_calendar_bcr_gp2, tx_age, tx_grade_group, tt_bcr, tx_tstage_gp)
+# data_cov %>% tbl_summary()
+newdata <- data.frame(tx_age=63,
+                      tx_grade_group="4+3",
+                      tt_bcr=13,
+                      tx_tstage_gp="T3")
+newdata <- expand_grid(newdata, 
+                       tt_bcr_to_salvage_tx_year=upper_t,
+                       tt_calendar_bcr_gp2 = head(levels(data_cov$tt_calendar_bcr_gp2), 3))
+# vary years based on maximum followups
+newdata <- newdata %>% filter((tt_calendar_bcr_gp2=="2001-2005"&tt_bcr_to_salvage_tx_year<=20)|
+                                (tt_calendar_bcr_gp2=="2006-2010"&tt_bcr_to_salvage_tx_year<=15)|
+                                (tt_calendar_bcr_gp2=="2011-2015"&tt_bcr_to_salvage_tx_year<=10)|
+                                (tt_calendar_bcr_gp2=="2016-2021"&tt_bcr_to_salvage_tx_year<=5))
+probs <- predict(mlog_spline, newdata=newdata, type="probs")
+colnames(probs) <- levels(data_trt$salvage_tx_type)
+gdset <- data.frame(newdata, probs)
+gdset_long <- gdset %>% pivot_longer(cols = tail(names(gdset), 3), 
+                                names_to = "Treatment",
+                                values_to = "Probability")
+ggList_vm1[[1]] <- ggplot(data = gdset_long, aes(x=tt_bcr_to_salvage_tx_year, y=Probability, color=Treatment))+
+  geom_line() + 
+  facet_grid(.~tt_calendar_bcr_gp2) +
+  ylab("Relative Hazard") + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+
+# Assume T~Weibull, estimate density corresponding to the overall failure time distribution
+library(survival)
+fit <- survreg(Surv(tt_bcr_to_salvage_tx_year,salvage_tx_type!="None") ~ tt_calendar_bcr_gp2+tx_age+tx_grade_group+tt_bcr+tx_tstage_gp, data=data, dist = "weibull")
+
+# CIF
+integrand <- function(t, fun_pi, fun_ft, col_name, cov){
+  df_new <- data.frame(tt_calendar_bcr_gp2=cov,
+                       tt_bcr_to_salvage_tx_year=t,
+                       tx_age=63,
+                       tx_grade_group="4+3",
+                       tt_bcr=13,
+                       tx_tstage_gp="T3")
+  pi <- predict(fun_pi, newdata=df_new,type="probs")
+  ft_risk <- predict(fun_ft, newdata=df_new, type='link')
+  shape <- 1/fun_ft$scale
+  scale <- exp(ft_risk)
+  f_t <- dweibull(x=t, shape=shape, scale=scale, log = FALSE)
+  (pi*f_t)[,col_name]
+}
+
+CIF_Hormones <- sapply(head(levels(data_cov$tt_calendar_bcr_gp2), 3), function(cov){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="Hormones", cov=cov, lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_Hormones <- CIF_Hormones %>% mutate(t = upper_t)
+CIF_Hormones <- CIF_Hormones %>% pivot_longer(cols = 1:(length(levels(data$tt_calendar_bcr_gp2))-1), 
+                                              names_to = "tt_bcr_calendar_year_gp",
+                                              values_to = "CIF")
+CIF_RT <- sapply(head(levels(data_cov$tt_calendar_bcr_gp2), 3), function(cov){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="RT", cov=cov, lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_RT <- CIF_RT %>% mutate(t = upper_t)
+CIF_RT <- CIF_RT %>% pivot_longer(cols = 1:(length(levels(data$tt_calendar_bcr_gp2))-1), 
+                                              names_to = "tt_bcr_calendar_year_gp",
+                                              values_to = "CIF")
+
+CIF_Hormones_RT <- sapply(head(levels(data_cov$tt_calendar_bcr_gp2), 3), function(cov){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, cov=cov, col_name="Hormones + RT", lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_Hormones_RT <- CIF_Hormones_RT %>% mutate(t = upper_t)
+CIF_Hormones_RT <- CIF_Hormones_RT %>% pivot_longer(cols = 1:(length(levels(data$tt_calendar_bcr_gp2))-1), 
+                                              names_to = "tt_bcr_calendar_year_gp",
+                                              values_to = "CIF")
+
+
+out <- rbind(CIF_Hormones, CIF_RT, CIF_Hormones_RT)
+out$Treatment <- rep(c("Hormones", "RT", "Hormones_RT"), each = nrow(CIF_Hormones))
+# vary years based on maximum followups
+out <- out %>% filter((tt_bcr_calendar_year_gp=="2001-2005"&t<=20)|
+                      (tt_bcr_calendar_year_gp=="2006-2010"&t<=15)|
+                      (tt_bcr_calendar_year_gp=="2011-2015"&t<=10)|
+                      (tt_bcr_calendar_year_gp=="2016-2021"&t<=5))
+
+ggList_vm1[[2]] <- ggplot(data = out, aes(x=t, y=CIF, color=Treatment))+
+  facet_grid(.~tt_bcr_calendar_year_gp) +
+  geom_line() + ylim(0,1) + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+ggarrange(plotlist = ggList_vm1, 
+          common.legend = TRUE,
+          labels = c("A", "B"),
+          ncol = 2, nrow = 1)
+
+## Johnason: ask for cut-off point for BCR calendar year to inform the preference of specific treatment
+```
+
+### Grade by calender year
+
+```{r}
+ggList_vm2 <- list()
+# estimate conditional probability of receiving each treatment at time t
+mlog_spline <- multinom(salvage_tx_type ~ bs(tt_bcr_to_salvage_tx_year) + tt_calendar_bcr_gp2+tx_age+tx_grade_group+tt_bcr+tx_tstage_gp, data = data_trt)
+data_cov <- data %>% select(tt_calendar_bcr_gp2, tx_age, tx_grade_group, tt_bcr, tx_tstage_gp)
+newdata <- data.frame(tx_age=63,
+                      tt_bcr=13,
+                      tx_tstage_gp="T3")
+newdata <- expand_grid(newdata, 
+                       tt_bcr_to_salvage_tx_year=upper_t,
+                       tx_grade_group=c("<=6", "3+4", "4+3", ">=8"),
+                       tt_calendar_bcr_gp2=levels(data$tt_calendar_bcr_gp2))
+# vary years based on maximum followups
+newdata <- newdata %>% filter((tt_calendar_bcr_gp2=="2001-2005"&tt_bcr_to_salvage_tx_year<=20)|
+                                (tt_calendar_bcr_gp2=="2006-2010"&tt_bcr_to_salvage_tx_year<=15)|
+                                (tt_calendar_bcr_gp2=="2011-2015"&tt_bcr_to_salvage_tx_year<=10)|
+                                (tt_calendar_bcr_gp2=="2016-2021"&tt_bcr_to_salvage_tx_year<=5))
+probs <- predict(mlog_spline, newdata=newdata, type="probs")
+colnames(probs) <- levels(data_trt$salvage_tx_type)
+gdset <- data.frame(newdata, probs)
+gdset_long <- gdset %>% pivot_longer(cols = tail(names(gdset), 3), 
+                                names_to = "Treatment",
+                                values_to = "Probability")
+gdset_long <-gdset_long %>% mutate(tx_grade_group = factor(tx_grade_group, levels = c("<=6", "3+4", "4+3", ">=8")))
+ggList_vm2[[1]] <- ggplot(data = gdset_long, aes(x=tt_bcr_to_salvage_tx_year, y=Probability, color=Treatment))+
+  geom_line() + 
+  facet_grid(tx_grade_group~tt_calendar_bcr_gp2) +
+  ylab("Relative Hazard") + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+
+# Assume T~Weibull, estimate density corresponding to the overall failure time distribution
+library(survival)
+fit <- survreg(Surv(tt_bcr_to_salvage_tx_year,salvage_tx_type!="None") ~ tt_calendar_bcr_gp2+tx_age+tx_grade_group+tt_bcr+tx_tstage_gp, data=data)
+
+# CIF
+integrand <- function(t, fun_pi, fun_ft, col_name, cov, strata){
+  df_new <- data.frame(tx_grade_group=cov,
+                       tt_bcr_to_salvage_tx_year=t,
+                       tx_age=63,
+                       tt_calendar_bcr_gp2=strata,
+                       tt_bcr=13,
+                       tx_tstage_gp="T3")
+  pi <- predict(fun_pi, newdata=df_new,type="probs")
+  ft_risk <- predict(fun_ft, newdata=df_new, type='link')
+  shape <- 1/fun_ft$scale
+  scale <- exp(ft_risk)
+  f_t <- dweibull(x=t, shape=shape, scale=scale, log = FALSE)
+  (pi*f_t)[,col_name]
+}
+cov_strata <- expand.grid(tx_grade_group=c("<=6", "3+4", "4+3", ">=8"),
+                          tt_calendar_bcr_gp2=levels(data$tt_calendar_bcr_gp2))
+CIF_Hormones <- apply(cov_strata, 1, function(row){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="Hormones", cov=row[1], strata=row[2], lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_Hormones <- CIF_Hormones %>% mutate(t = upper_t)
+CIF_Hormones <- CIF_Hormones %>% pivot_longer(cols = 1:nrow(cov_strata), 
+                                              names_to = "cov_strata",
+                                              values_to = "CIF")
+CIF_Hormones$cov_strata <- as.numeric(gsub('\\D+', '', CIF_Hormones$cov_strata))
+CIF_Hormones <- CIF_Hormones %>% arrange(cov_strata, t)
+CIF_Hormones <- data.frame(CIF_Hormones, cov_strata[CIF_Hormones$cov_strata,])
+
+CIF_RT <- apply(cov_strata, 1, function(row){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, col_name="RT", cov=row[1], strata=row[2], lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_RT <- CIF_RT %>% mutate(t = upper_t)
+CIF_RT <- CIF_RT %>% pivot_longer(cols = 1:nrow(cov_strata), 
+                                              names_to = "cov_strata",
+                                              values_to = "CIF")
+CIF_RT$cov_strata <- as.numeric(gsub('\\D+', '', CIF_RT$cov_strata))
+CIF_RT <- CIF_RT %>% arrange(cov_strata, t)
+CIF_RT <- data.frame(CIF_RT, cov_strata[CIF_RT$cov_strata,])
+
+CIF_Hormones_RT <- apply(cov_strata, 1, function(row){sapply(upper_t, function(t) integrate(integrand, fun_pi=mlog_spline, fun_ft=fit, cov=row[1], strata=row[2], col_name="Hormones + RT", lower = 0, upper = t)$value)}) %>% as.data.frame()
+CIF_Hormones_RT <- CIF_Hormones_RT %>% mutate(t = upper_t)
+CIF_Hormones_RT <- CIF_Hormones_RT %>% pivot_longer(cols = 1:nrow(cov_strata), 
+                                              names_to = "cov_strata",
+                                              values_to = "CIF")
+CIF_Hormones_RT$cov_strata <- as.numeric(gsub('\\D+', '', CIF_Hormones_RT$cov_strata))
+CIF_Hormones_RT <- CIF_Hormones_RT %>% arrange(cov_strata, t)
+CIF_Hormones_RT <- data.frame(CIF_Hormones_RT, cov_strata[CIF_Hormones_RT$cov_strata,])
+
+
+out <- rbind(CIF_Hormones, CIF_RT, CIF_Hormones_RT)
+out$Treatment <- rep(c("Hormones", "RT", "Hormones_RT"), each = nrow(CIF_Hormones))
+# vary years based on maximum followups
+out <- out %>% filter((tt_calendar_bcr_gp2=="2001-2005"&t<=20)|
+                      (tt_calendar_bcr_gp2=="2006-2010"&t<=15)|
+                      (tt_calendar_bcr_gp2=="2011-2015"&t<=10)|
+                      (tt_calendar_bcr_gp2=="2016-2021"&t<=5))
+
+ggList_vm2[[2]] <- ggplot(data = out, aes(x=t, y=CIF, color=Treatment))+
+  facet_grid(tx_grade_group~tt_calendar_bcr_gp2) +
+  geom_line() + ylim(0,1) + xlab("Time (in Years) from BCR to salvage treatment") +
+  theme_minimal()
+ggarrange(plotlist = ggList_vm2, 
+          common.legend = TRUE,
+          labels = c("A", "B"),
+          ncol = 2, nrow = 1)
+# ggsave(here("results", "plot_vm_cov.png"), height = 8, width = 10)
+```
+
+Vertical modeling are explored to not only estimate the cumulative incident of receiving salvage treatment (CIF), but also calculate the proportion of receiving each type of salvage treatment at each time point (relative hazard). In Figure without accounting for covariates, we find RT is most preferable for those who received salvage treatment right after BCR, following by hormones. For those receiving later treatment, they are more and more likely to receive hormone therapy rather than RT and combination of hormone and RT. The CIF plot shows that the difference in the cumulative probability of receiving each type of treatment within first 3 years isn't that noticeable, while after that hormone therapy receipt increases fast and approaches to 44\% at 20 years after BCR. Figure shows the cumulative incidence within subgroups of BCR calendar year and Gleason grade group. Before 2010, all grade groups prefer RT except for high risk ($\geq8$) group which endorses hormones therapy. This reveals that prior to 2010, RT is more favorable in low risk and intermediate risk groups. While after that, RT lost the lead, hormones and combination of hormones and RT are running neck and neck with it, especially for high risk group, RT is least preferable for both immediate and late salvage treatment.
+
+
